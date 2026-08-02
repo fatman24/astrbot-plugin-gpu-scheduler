@@ -1,0 +1,12 @@
+name: astrbot_plugin_gpu_scheduler
+display_name: GPU 调度器
+short_desc: 定时切换 AstrBot 模型至 DeepSeek/Ollama，避免游戏时 GPU 被占用
+desc: >
+  自动管理 Ollama 本地模型和 DeepSeek 云端模型的切换。
+  工作日晚间(18:00-01:30)及周末全天自动释放 GPU，
+  同时提供 /gpu_free 和 /gpu_local 命令手动切换。
+author: zeroo
+version: 1.0.0
+repo: https://github.com/fatman24/astrbot-plugin-gpu-scheduler
+support_platforms:
+  - aiocqhttp
