@@ -2,7 +2,7 @@ import requests, json
 
 BASE = 'http://127.0.0.1:6185/api/v1'
 r = requests.post(BASE + '/auth/login',
-    json={'username': 'astrbot', 'password': 'ZEr@1201390032'})
+    json={'username': 'astrbot', 'password': 'YOUR_PASSWORD_HERE'})
 t = r.json()['data']['token']
 h = {'Authorization': 'Bearer ' + t, 'Content-Type': 'application/json'}
 

@@ -5,7 +5,7 @@ cmd1 = """
 docker exec astrbot python3 -c "
 import requests
 BASE='http://127.0.0.1:6185/api/v1'
-r=requests.post(BASE+'/auth/login',json={'username':'astrbot','password':'ZEr@1201390032'})
+r=requests.post(BASE+'/auth/login',json={'username':'astrbot','password':'YOUR_PASSWORD_HERE'})
 t=r.json()['data']['token']
 h={'Authorization':'Bearer '+t}
 r=requests.get(BASE+'/providers',headers=h)
@@ -25,7 +25,7 @@ cmd3 = """docker exec astrbot cat data/gpu_scheduler_state.json 2>/dev/null || e
 for label, cmd in [("=== Provider 状态 ===", cmd1), ("=== GPU Scheduler 日志 ===", cmd2), ("=== 状态文件 ===", cmd3)]:
     print(label)
     result = subprocess.run(
-        ['ssh', '-o', 'StrictHostKeyChecking=no', 'root@192.168.100.115', cmd],
+        ['ssh', '-o', 'StrictHostKeyChecking=no', 'root@YOUR_NAS_IP', cmd],
         capture_output=True, text=True
     )
     print(result.stdout)
