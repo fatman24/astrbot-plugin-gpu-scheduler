@@ -1,0 +1,131 @@
+{
+  "api_url": {
+    "description": "AstrBot API 地址",
+    "type": "string",
+    "default": "http://127.0.0.1:6185",
+    "hint": "通常无需修改，除非 AstrBot 在非本机或非默认端口运行"
+  },
+  "api_user": {
+    "description": "AstrBot 登录用户名",
+    "type": "string",
+    "default": "astrbot"
+  },
+  "api_password": {
+    "description": "AstrBot 登录密码",
+    "type": "string",
+    "default": ""
+  },
+  "allowed_users": {
+    "description": "允许使用 /gpu_free 和 /gpu_local 命令的用户 ID",
+    "type": "list",
+    "default": [],
+    "hint": "每行一个 QQ 号。留空则仅允许插件原作者使用。",
+    "items": {
+      "type": "string"
+    }
+  },
+  "enable_schedule": {
+    "description": "启用定时调度",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后仅支持手动 /gpu_free 和 /gpu_local 命令"
+  },
+  "timezone": {
+    "description": "时区",
+    "type": "string",
+    "default": "Asia/Shanghai",
+    "hint": "例如 Asia/Shanghai, Asia/Tokyo, America/New_York"
+  },
+  "schedule_weekday_deepseek_time": {
+    "description": "工作日切换至 DeepSeek 的时间",
+    "type": "string",
+    "default": "18:00",
+    "hint": "格式 HH:MM（24小时制）。周一至周四此时切换为 DeepSeek，释放 GPU"
+  },
+  "schedule_weekday_ollama_time": {
+    "description": "工作日切换回 Ollama 的时间",
+    "type": "string",
+    "default": "01:30",
+    "hint": "格式 HH:MM。周二至周五此时切回 Ollama，恢复 GPU"
+  },
+  "enable_weekend_deepseek": {
+    "description": "周末全天使用 DeepSeek",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后周末也使用工作日时间表（即周末白天用 Ollama）"
+  },
+  "schedule_weekend_deepseek_time": {
+    "description": "周五晚切换至 DeepSeek 的时间",
+    "type": "string",
+    "default": "18:00",
+    "hint": "格式 HH:MM"
+  },
+  "schedule_weekend_ollama_time": {
+    "description": "周一早切换回 Ollama 的时间",
+    "type": "string",
+    "default": "01:30",
+    "hint": "格式 HH:MM"
+  },
+  "ollama_providers": {
+    "description": "需要切换的 Ollama Provider ID 列表",
+    "type": "list",
+    "default": [
+      "ollama/qwen3.6:35b",
+      "ollama/nemotron-cascade-2:latest"
+    ],
+    "hint": "每行一个 provider ID。切到 DeepSeek 时会禁用这些 provider",
+    "items": {
+      "type": "string"
+    }
+  },
+  "deepseek_providers": {
+    "description": "DeepSeek Provider ID 列表",
+    "type": "list",
+    "default": [
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro"
+    ],
+    "hint": "切到 DeepSeek 时会确保这些 provider 处于启用状态。第一个 provider 作为 Ollama 的默认 fallback",
+    "items": {
+      "type": "string"
+    }
+  },
+  "enable_config_sync": {
+    "description": "切换模型时自动同步其他插件的 provider 引用",
+    "type": "bool",
+    "default": true,
+    "hint": "切到 DeepSeek 时递归扫描 data/config/ 下 JSON 配置，将 Ollama provider 引用替换为 DeepSeek；切回时自动恢复"
+  },
+  "config_sync_skip_keys": {
+    "description": "配置同步时跳过的 key 关键词",
+    "type": "list",
+    "default": [
+      "image",
+      "caption",
+      "vision",
+      "reverse"
+    ],
+    "hint": "包含这些关键词的配置项不会被替换。例如 image_provider、caption_model 等视觉相关配置需要保留本地模型，因为 DeepSeek V4 不支持多模态",
+    "items": {
+      "type": "string"
+    }
+  },
+  "config_dir": {
+    "description": "AstrBot 插件配置目录（容器内绝对路径）",
+    "type": "string",
+    "default": "/AstrBot/data/config",
+    "hint": "Docker 容器内的路径。如果 AstrBot 安装在非标准位置需要修改"
+  },
+  "backup_dir": {
+    "description": "插件配置备份目录（相对插件 data 目录）",
+    "type": "string",
+    "default": "data/gpu_scheduler_backups",
+    "hint": "切到 DeepSeek 前会备份原始插件配置到此目录，切回时从此恢复"
+  },
+  "token_refresh_margin": {
+    "description": "Token 提前刷新时间（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "Token 到期前多少秒开始刷新"
+  }
+}

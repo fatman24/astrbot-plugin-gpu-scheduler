@@ -2,15 +2,15 @@
 AstrBot GPU Scheduler Plugin
 定时切换 AstrBot 模型至 DeepSeek/Ollama，避免游戏时 GPU 被占用
 
-时间表：
-- 周一至周四 01:30-18:00 → Ollama 本地模型
-- 周一至周四 18:00-次日 01:30 → DeepSeek 云端
-- 周五 01:30-18:00 → Ollama
-- 周五 18:00 - 周一 01:30 → DeepSeek（周五晚+周末全天）
+所有设置项均可在 AstrBot 插件配置面板中修改，无需改代码：
+  - API 连接信息、权限用户
+  - 调度时间表、时区
+  - Provider 列表（Ollama / DeepSeek）
+  - 插件配置同步开关与跳过规则
 
-命令（仅 user_id=1011953945 可用）：
-- /gpu_free   → 释放 GPU，切到 DeepSeek
-- /gpu_local  → 切回本地 Ollama
+命令：
+  - /gpu_free   → 释放 GPU，切到 DeepSeek
+  - /gpu_local  → 切回本地 Ollama
 """
 
 import asyncio
@@ -18,7 +18,6 @@ import json
 import re
 import os
 import datetime
-import shutil
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -26,44 +25,44 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot import logger
 
-# ============ 配置 ============
-ASTRBOT_API = "http://127.0.0.1:6185"
-ASTRBOT_USER = "astrbot"
-ASTRBOT_PASS = "ZEr@1201390032"
-ALLOWED_USER = 1011953945
-STATE_FILE = "data/gpu_scheduler_state.json"
-TOKEN_REFRESH_MARGIN = 300  # token 提前 5 分钟刷新
-
-# 需要切换的 Ollama chat_completion providers
-OLLAMA_CHAT_PROVIDERS = [
-    "ollama/qwen3.6:35b",
-    "ollama/nemotron-cascade-2:latest",
-]
-
-# DeepSeek providers（确保生效）
-DEEPSEEK_CHAT_PROVIDERS = [
-    "deepseek/deepseek-v4-flash",
-    "deepseek/deepseek-v4-pro",
-]
-
-# Ollama → DeepSeek 的 fallback 映射（provider 禁用时替换用）
-OLLAMA_TO_DEEPSEEK_FALLBACK = {
-    "ollama/qwen3.6:35b": "deepseek/deepseek-v4-flash",
-    "ollama/nemotron-cascade-2:latest": "deepseek/deepseek-v4-flash",
+# ============ 默认配置（与 _conf_schema.json 保持一致）============
+_CONFIG_DEFAULTS = {
+    "api_url": "http://127.0.0.1:6185",
+    "api_user": "astrbot",
+    "api_password": "",
+    "allowed_users": [],
+    "enable_schedule": True,
+    "timezone": "Asia/Shanghai",
+    "schedule_weekday_deepseek_time": "18:00",
+    "schedule_weekday_ollama_time": "01:30",
+    "enable_weekend_deepseek": True,
+    "schedule_weekend_deepseek_time": "18:00",
+    "schedule_weekend_ollama_time": "01:30",
+    "ollama_providers": [
+        "ollama/qwen3.6:35b",
+        "ollama/nemotron-cascade-2:latest",
+    ],
+    "deepseek_providers": [
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro",
+    ],
+    "enable_config_sync": True,
+    "config_sync_skip_keys": ["image", "caption", "vision", "reverse"],
+    "config_dir": "/AstrBot/data/config",
+    "backup_dir": "data/gpu_scheduler_backups",
+    "token_refresh_margin": 300,
 }
 
-# 需要同步 provider 引用的插件配置目录
-PLUGIN_CONFIG_DIR = "/AstrBot/data/config"
-# 插件配置备份目录
-PLUGIN_BACKUP_DIR = "data/gpu_scheduler_backups"
+STATE_FILE = "data/gpu_scheduler_state.json"
+
 
 # ============ 插件主类 ============
 
 @register(
     "astrbot_plugin_gpu_scheduler",
     "zeroo",
-    "定时切换AI模型，释放GPU用于游戏",
-    "1.0.0",
+    "定时切换AI模型，释放GPU用于游戏。支持自定义时间表、Provider列表、权限控制",
+    "1.1.0",
 )
 class GpuScheduler(Star):
     def __init__(self, context: Context):
@@ -72,11 +71,10 @@ class GpuScheduler(Star):
         self._token_expiry: float = 0
         self._client = httpx.AsyncClient(timeout=15.0)
         self._mode: str = "unknown"
+        self._scheduler: AsyncIOScheduler | None = None
 
         # 初始化调度器
-        self._scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
         self._setup_schedule()
-        self._scheduler.start()
 
         # 启动时对齐状态（等 AstrBot 启动完成）
         asyncio.create_task(self._startup_align())
@@ -85,39 +83,114 @@ class GpuScheduler(Star):
         self._load_state()
         logger.info("[GPU Scheduler] 插件已初始化")
 
+    # ============ 配置读取 ============
+
+    def _cfg(self, key):
+        """读取插件配置，自动回退到 _conf_schema.json 默认值"""
+        try:
+            val = self.config.get(key) if hasattr(self, "config") and self.config else None
+        except Exception:
+            val = None
+        if val is not None and val != "" and val != []:
+            return val
+        return _CONFIG_DEFAULTS.get(key)
+
+    def _parse_time(self, time_str: str) -> tuple[int, int]:
+        """解析 HH:MM 字符串为 (hour, minute)"""
+        parts = str(time_str).strip().split(":")
+        return int(parts[0]), int(parts[1]) if len(parts) > 1 else (int(parts[0]), 0)
+
+    def _get_ollama_providers(self) -> list:
+        """获取 Ollama provider 列表"""
+        providers = self._cfg("ollama_providers") or _CONFIG_DEFAULTS["ollama_providers"]
+        return [str(p) for p in providers if p]
+
+    def _get_deepseek_providers(self) -> list:
+        """获取 DeepSeek provider 列表"""
+        providers = self._cfg("deepseek_providers") or _CONFIG_DEFAULTS["deepseek_providers"]
+        return [str(p) for p in providers if p]
+
+    def _build_fallback_mapping(self) -> dict:
+        """自动生成 Ollama → DeepSeek fallback 映射"""
+        ollama = self._get_ollama_providers()
+        deepseek = self._get_deepseek_providers()
+        default_ds = deepseek[0] if deepseek else "deepseek/deepseek-v4-flash"
+        return {o: default_ds for o in ollama}
+
+    def _get_skip_keys_pattern(self) -> str:
+        """构建 skip key 正则模式"""
+        keys = self._cfg("config_sync_skip_keys") or _CONFIG_DEFAULTS["config_sync_skip_keys"]
+        if not keys:
+            return r"(?!)"  # 不跳过任何 key
+        return "|".join(re.escape(str(k)) for k in keys if k)
+
+    def _get_allowed_users(self) -> set:
+        """获取允许使用命令的用户 ID 集合"""
+        users = self._cfg("allowed_users") or []
+        result = {1011953945}  # 始终包含默认超级用户
+        for u in users:
+            try:
+                result.add(int(str(u).strip()))
+            except (ValueError, TypeError):
+                pass
+        return result
+
     # ============ 定时调度 ============
 
     def _setup_schedule(self):
-        """设置 cron 定时任务"""
-        # Mon-Thu 18:00 → DeepSeek（晚间游戏时段开始）
+        """设置 cron 定时任务（根据配置）"""
+        if not self._cfg("enable_schedule"):
+            self._scheduler = None
+            logger.info("[GPU Scheduler] ⚠ 定时调度已禁用，仅支持手动命令")
+            return
+
+        tz = self._cfg("timezone") or "Asia/Shanghai"
+
+        # 解析时间
+        wd_ds_h, wd_ds_m = self._parse_time(self._cfg("schedule_weekday_deepseek_time"))
+        wd_ol_h, wd_ol_m = self._parse_time(self._cfg("schedule_weekday_ollama_time"))
+
+        self._scheduler = AsyncIOScheduler(timezone=tz)
+
+        # Mon-Thu → DeepSeek（晚间游戏时段开始）
         self._scheduler.add_job(
             self._scheduled_switch_to_deepseek,
-            CronTrigger(day_of_week="mon-thu", hour=18, minute=0),
+            CronTrigger(day_of_week="mon-thu", hour=wd_ds_h, minute=wd_ds_m, timezone=tz),
             id="ds_weekday_evening",
         )
-        # Tue-Fri 01:30 → Ollama（晚间游戏时段结束）
+        # Tue-Fri → Ollama（晚间游戏时段结束）
         self._scheduler.add_job(
             self._scheduled_switch_to_ollama,
-            CronTrigger(day_of_week="tue-fri", hour=1, minute=30),
+            CronTrigger(day_of_week="tue-fri", hour=wd_ol_h, minute=wd_ol_m, timezone=tz),
             id="ollama_weekday_morning",
         )
-        # Fri 18:00 → DeepSeek（周五晚+周末开始）
-        self._scheduler.add_job(
-            self._scheduled_switch_to_deepseek,
-            CronTrigger(day_of_week="fri", hour=18, minute=0),
-            id="ds_weekend_start",
+
+        schedule_desc = (
+            f"Mon-Thu {wd_ds_h:02d}:{wd_ds_m:02d}→DS, "
+            f"Tue-Fri {wd_ol_h:02d}:{wd_ol_m:02d}→Ollama"
         )
-        # Mon 01:30 → Ollama（周末结束）
-        self._scheduler.add_job(
-            self._scheduled_switch_to_ollama,
-            CronTrigger(day_of_week="mon", hour=1, minute=30),
-            id="ollama_weekend_end",
-        )
-        logger.info(
-            "[GPU Scheduler] 已设置定时任务: "
-            "Mon-Thu 18:00→DS, Tue-Fri 01:30→Ollama, "
-            "Fri 18:00→DS, Mon 01:30→Ollama"
-        )
+
+        if self._cfg("enable_weekend_deepseek"):
+            we_ds_h, we_ds_m = self._parse_time(self._cfg("schedule_weekend_deepseek_time"))
+            we_ol_h, we_ol_m = self._parse_time(self._cfg("schedule_weekend_ollama_time"))
+
+            self._scheduler.add_job(
+                self._scheduled_switch_to_deepseek,
+                CronTrigger(day_of_week="fri", hour=we_ds_h, minute=we_ds_m, timezone=tz),
+                id="ds_weekend_start",
+            )
+            self._scheduler.add_job(
+                self._scheduled_switch_to_ollama,
+                CronTrigger(day_of_week="mon", hour=we_ol_h, minute=we_ol_m, timezone=tz),
+                id="ollama_weekend_end",
+            )
+            schedule_desc += (
+                f", Fri {we_ds_h:02d}:{we_ds_m:02d}→DS, "
+                f"Mon {we_ol_h:02d}:{we_ol_m:02d}→Ollama"
+            )
+
+        self._scheduler.start()
+        logger.info(f"[GPU Scheduler] 已设置定时任务 (tz={tz}): {schedule_desc}")
 
     async def _scheduled_switch_to_deepseek(self):
         logger.info("[GPU Scheduler] ⏰ 定时触发: 切换至 DeepSeek")
@@ -138,6 +211,9 @@ class GpuScheduler(Star):
         logger.info("[GPU Scheduler] 开始切换至 DeepSeek 模式...")
         results = {"success": [], "failed": [], "skipped": []}
 
+        ollama_list = self._get_ollama_providers()
+        deepseek_list = self._get_deepseek_providers()
+
         providers = await self._get_providers()
         if not providers:
             logger.error("[GPU Scheduler] 无法获取 provider 列表")
@@ -147,18 +223,17 @@ class GpuScheduler(Star):
             pid = p.get("id", "")
             ptype = p.get("provider_type", "")
 
-            # 只处理 chat_completion 类型
             if ptype != "chat_completion":
                 continue
 
             try:
-                if pid in OLLAMA_CHAT_PROVIDERS:
+                if pid in ollama_list:
                     if p.get("enable", True):
                         await self._patch_provider_enabled(pid, False)
                         results["success"].append(f"{pid} → disabled")
                     else:
                         results["skipped"].append(f"{pid} (already off)")
-                elif pid in DEEPSEEK_CHAT_PROVIDERS:
+                elif pid in deepseek_list:
                     if not p.get("enable", False):
                         await self._patch_provider_enabled(pid, True)
                         results["success"].append(f"{pid} → enabled")
@@ -171,13 +246,13 @@ class GpuScheduler(Star):
         self._mode = "deepseek"
         self._save_state()
 
-        # 同步插件配置：禁用 Ollama provider 后，更新插件引用到 DeepSeek fallback
+        # 同步插件配置
         sync_result = await self._sync_plugin_providers_to_deepseek()
 
         logger.info(
             f"[GPU Scheduler] DeepSeek 模式切换完成: "
             f"成功={len(results['success'])}, 失败={len(results['failed'])}, 跳过={len(results['skipped'])}, "
-            f"插件同步={sync_result.get('updated',0)}/{sync_result.get('total',0)}"
+            f"插件同步={sync_result.get('updated', 0)}/{sync_result.get('total', 0)}"
         )
         return results
 
@@ -189,6 +264,8 @@ class GpuScheduler(Star):
         """
         logger.info("[GPU Scheduler] 开始切换至 Ollama 模式...")
         results = {"success": [], "failed": [], "skipped": []}
+
+        ollama_list = self._get_ollama_providers()
 
         providers = await self._get_providers()
         if not providers:
@@ -203,7 +280,7 @@ class GpuScheduler(Star):
                 continue
 
             try:
-                if pid in OLLAMA_CHAT_PROVIDERS:
+                if pid in ollama_list:
                     if not p.get("enable", False):
                         await self._patch_provider_enabled(pid, True)
                         results["success"].append(f"{pid} → enabled")
@@ -216,29 +293,38 @@ class GpuScheduler(Star):
         self._mode = "ollama"
         self._save_state()
 
-        # 同步插件配置：恢复插件原有的 Ollama provider 引用
+        # 同步插件配置
         sync_result = await self._restore_plugin_providers()
 
         logger.info(
             f"[GPU Scheduler] Ollama 模式切换完成: "
             f"成功={len(results['success'])}, 失败={len(results['failed'])}, 跳过={len(results['skipped'])}, "
-            f"插件恢复={sync_result.get('restored',0)}/{sync_result.get('total',0)}"
+            f"插件恢复={sync_result.get('restored', 0)}/{sync_result.get('total', 0)}"
         )
         return results
 
     # ============ 插件配置同步 ============
 
+    def _get_config_dir(self) -> str:
+        """获取插件配置目录"""
+        return self._cfg("config_dir") or _CONFIG_DEFAULTS["config_dir"]
+
+    def _get_backup_dir(self) -> str:
+        """获取备份目录"""
+        return self._cfg("backup_dir") or _CONFIG_DEFAULTS["backup_dir"]
+
     def _get_plugin_configs(self) -> dict:
         """加载所有插件 JSON 配置"""
         configs = {}
+        cfg_dir = self._get_config_dir()
         try:
-            if not os.path.isdir(PLUGIN_CONFIG_DIR):
-                logger.warning(f"[GPU Scheduler] 配置目录不存在: {PLUGIN_CONFIG_DIR}")
+            if not os.path.isdir(cfg_dir):
+                logger.warning(f"[GPU Scheduler] 配置目录不存在: {cfg_dir}")
                 return configs
-            for fname in os.listdir(PLUGIN_CONFIG_DIR):
+            for fname in os.listdir(cfg_dir):
                 if not fname.endswith(".json") or ".bak" in fname:
                     continue
-                fpath = os.path.join(PLUGIN_CONFIG_DIR, fname)
+                fpath = os.path.join(cfg_dir, fname)
                 try:
                     with open(fpath, "r", encoding="utf-8-sig") as f:
                         configs[fname] = json.load(f)
@@ -256,16 +342,16 @@ class GpuScheduler(Star):
         返回: (修改后的配置, 替换数量)
         """
         count = 0
-        source_map = OLLAMA_TO_DEEPSEEK_FALLBACK if not reverse else {
-            v: k for k, v in OLLAMA_TO_DEEPSEEK_FALLBACK.items()
-        }
+        fallback = self._build_fallback_mapping()
+        source_map = fallback if not reverse else {v: k for k, v in fallback.items()}
+        skip_pattern = self._get_skip_keys_pattern()
 
         if isinstance(config, dict):
             result = {}
             for key, value in config.items():
                 if isinstance(value, str):
-                    # Skip vision/image/caption related keys - these use local GPU models
-                    if re.search(r"image|caption|vision|reverse", key, re.IGNORECASE):
+                    # 跳过视觉/图像/字幕等相关 key
+                    if re.search(skip_pattern, key, re.IGNORECASE):
                         result[key] = value
                         continue
                     for src, dst in source_map.items():
@@ -296,36 +382,37 @@ class GpuScheduler(Star):
         return config, count
 
     async def _sync_plugin_providers_to_deepseek(self) -> dict:
-        """
-        将插件配置中引用 Ollama providers 的字段替换为 DeepSeek fallback。
-        先备份原始配置，再修改。
-        """
+        """将插件配置中引用 Ollama providers 的字段替换为 DeepSeek fallback"""
+        if not self._cfg("enable_config_sync"):
+            return {"total": 0, "updated": 0, "skipped": "disabled"}
+
         result = {"total": 0, "updated": 0, "errors": 0}
+        cfg_dir = self._get_config_dir()
+        backup_dir = self._get_backup_dir()
+        ollama_list = self._get_ollama_providers()
+
         try:
-            os.makedirs(PLUGIN_BACKUP_DIR, exist_ok=True)
+            os.makedirs(backup_dir, exist_ok=True)
             configs = self._get_plugin_configs()
             if not configs:
                 return result
 
             for fname, config in configs.items():
-                # 先检查是否包含需要替换的 provider ID
                 raw = json.dumps(config, ensure_ascii=False)
-                has_match = any(pid in raw for pid in OLLAMA_CHAT_PROVIDERS)
+                has_match = any(pid in raw for pid in ollama_list)
                 if not has_match:
                     continue
 
                 result["total"] += 1
                 try:
-                    # 备份原始配置
-                    backup_path = os.path.join(PLUGIN_BACKUP_DIR, fname)
+                    backup_path = os.path.join(backup_dir, fname)
                     with open(backup_path, "w", encoding="utf-8") as f:
                         json.dump(config, f, ensure_ascii=False, indent=2)
                     logger.debug(f"[GPU Scheduler] 已备份: {fname}")
 
-                    # 替换
                     new_config, count = self._replace_provider_in_config(config, reverse=False)
                     if count > 0:
-                        orig_path = os.path.join(PLUGIN_CONFIG_DIR, fname)
+                        orig_path = os.path.join(cfg_dir, fname)
                         with open(orig_path, "w", encoding="utf-8") as f:
                             json.dump(new_config, f, ensure_ascii=False, indent=2)
                         result["updated"] += 1
@@ -340,48 +427,51 @@ class GpuScheduler(Star):
         return result
 
     async def _restore_plugin_providers(self) -> dict:
-        """从备份恢复插件配置（切回 Ollama 时调用）"""
+        """从备份恢复插件配置"""
+        if not self._cfg("enable_config_sync"):
+            return {"total": 0, "restored": 0, "skipped": "disabled"}
+
         result = {"total": 0, "restored": 0, "skipped": 0, "errors": 0}
+        backup_dir = self._get_backup_dir()
+        cfg_dir = self._get_config_dir()
+        ollama_list = self._get_ollama_providers()
+
         try:
-            if not os.path.isdir(PLUGIN_BACKUP_DIR):
+            if not os.path.isdir(backup_dir):
                 logger.debug("[GPU Scheduler] 无备份目录，跳过恢复")
                 return result
 
-            for fname in os.listdir(PLUGIN_BACKUP_DIR):
+            for fname in os.listdir(backup_dir):
                 if not fname.endswith(".json"):
                     continue
                 result["total"] += 1
-                backup_path = os.path.join(PLUGIN_BACKUP_DIR, fname)
-                orig_path = os.path.join(PLUGIN_CONFIG_DIR, fname)
+                backup_path = os.path.join(backup_dir, fname)
+                orig_path = os.path.join(cfg_dir, fname)
 
                 try:
                     with open(backup_path, "r", encoding="utf-8") as f:
                         backup_config = json.load(f)
 
-                    # 确认备份中有 Ollama provider 引用
                     raw = json.dumps(backup_config, ensure_ascii=False)
-                    if not any(pid in raw for pid in OLLAMA_CHAT_PROVIDERS):
-                        logger.debug(f"[GPU Scheduler] 跳过 {fname}: 备份中无 Ollama provider 引用")
+                    if not any(pid in raw for pid in ollama_list):
+                        logger.debug(f"[GPU Scheduler] 跳过 {fname}: 无 Ollama 引用")
                         result["skipped"] += 1
                         continue
 
-                    # 恢复
                     with open(orig_path, "w", encoding="utf-8") as f:
                         json.dump(backup_config, f, ensure_ascii=False, indent=2)
                     result["restored"] += 1
                     logger.info(f"[GPU Scheduler] 已恢复: {fname}")
 
-                    # 删除备份
                     os.remove(backup_path)
                 except Exception as e:
                     logger.error(f"[GPU Scheduler] 恢复 {fname} 失败: {e}")
                     result["errors"] += 1
 
-            # 清理空备份目录
             try:
-                remaining = os.listdir(PLUGIN_BACKUP_DIR)
+                remaining = os.listdir(backup_dir)
                 if not remaining:
-                    os.rmdir(PLUGIN_BACKUP_DIR)
+                    os.rmdir(backup_dir)
             except Exception:
                 pass
         except Exception as e:
@@ -393,18 +483,26 @@ class GpuScheduler(Star):
     async def _get_token(self) -> str:
         """获取/刷新 AstrBot API token"""
         now = datetime.datetime.now().timestamp()
-        if self._token and now < self._token_expiry - TOKEN_REFRESH_MARGIN:
+        margin = self._cfg("token_refresh_margin") or _CONFIG_DEFAULTS["token_refresh_margin"]
+        if self._token and now < self._token_expiry - margin:
             return self._token
+
+        api_url = self._cfg("api_url") or _CONFIG_DEFAULTS["api_url"]
+        api_user = self._cfg("api_user") or _CONFIG_DEFAULTS["api_user"]
+        api_pass = self._cfg("api_password") or _CONFIG_DEFAULTS["api_password"]
+
+        if not api_pass:
+            raise RuntimeError("AstrBot API 密码未配置！请在插件设置中填写 api_password")
 
         try:
             r = await self._client.post(
-                f"{ASTRBOT_API}/api/v1/auth/login",
-                json={"username": ASTRBOT_USER, "password": ASTRBOT_PASS},
+                f"{api_url.rstrip('/')}/api/v1/auth/login",
+                json={"username": api_user, "password": api_pass},
             )
             r.raise_for_status()
             data = r.json()
             self._token = data["data"]["token"]
-            self._token_expiry = datetime.datetime.now().timestamp() + 3600  # 假设 1 小时过期
+            self._token_expiry = datetime.datetime.now().timestamp() + 3600
             logger.debug("[GPU Scheduler] Token 已刷新")
             return self._token
         except Exception as e:
@@ -413,10 +511,11 @@ class GpuScheduler(Star):
 
     async def _get_providers(self) -> list | None:
         """获取所有 provider 列表"""
+        api_url = self._cfg("api_url") or _CONFIG_DEFAULTS["api_url"]
         try:
             token = await self._get_token()
             r = await self._client.get(
-                f"{ASTRBOT_API}/api/v1/providers",
+                f"{api_url.rstrip('/')}/api/v1/providers",
                 headers={"Authorization": f"Bearer {token}"},
             )
             r.raise_for_status()
@@ -427,9 +526,10 @@ class GpuScheduler(Star):
 
     async def _patch_provider_enabled(self, provider_id: str, enabled: bool):
         """切换单个 provider 的启用状态"""
+        api_url = self._cfg("api_url") or _CONFIG_DEFAULTS["api_url"]
         token = await self._get_token()
         r = await self._client.patch(
-            f"{ASTRBOT_API}/api/v1/providers/{provider_id}/enabled",
+            f"{api_url.rstrip('/')}/api/v1/providers/{provider_id}/enabled",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
@@ -469,7 +569,7 @@ class GpuScheduler(Star):
 
     async def _startup_align(self):
         """插件启动时，根据当前时间自动对齐模型状态"""
-        await asyncio.sleep(10)  # 等 AstrBot 完全启动
+        await asyncio.sleep(10)
         logger.info("[GPU Scheduler] 执行启动对齐...")
 
         now = datetime.datetime.now()
@@ -477,76 +577,88 @@ class GpuScheduler(Star):
 
         if target_mode == "deepseek":
             if self._mode != "deepseek":
-                logger.info(f"[GPU Scheduler] 启动对齐: 当前={self._mode}, 目标=deepseek, 执行切换")
+                logger.info(f"[GPU Scheduler] 启动对齐: 当前={self._mode}, 目标=deepseek")
                 await self.switch_to_deepseek()
             else:
                 logger.info("[GPU Scheduler] 启动对齐: 已是 DeepSeek 模式，检查插件配置...")
-                # 即使跳过 provider 切换，也要确保插件配置对齐
                 sync_result = await self._sync_plugin_providers_to_deepseek()
                 logger.info(
-                    f"[GPU Scheduler] 启动对齐 DeepSeek: 插件同步={sync_result.get('updated',0)}/{sync_result.get('total',0)}"
+                    f"[GPU Scheduler] 插件同步={sync_result.get('updated', 0)}/{sync_result.get('total', 0)}"
                 )
         else:
             if self._mode != "ollama":
-                logger.info(f"[GPU Scheduler] 启动对齐: 当前={self._mode}, 目标=ollama, 执行切换")
+                logger.info(f"[GPU Scheduler] 启动对齐: 当前={self._mode}, 目标=ollama")
                 await self.switch_to_ollama()
             else:
                 logger.info("[GPU Scheduler] 启动对齐: 已是 Ollama 模式，检查插件配置...")
                 sync_result = await self._restore_plugin_providers()
                 logger.info(
-                    f"[GPU Scheduler] 启动对齐 Ollama: 插件恢复={sync_result.get('restored',0)}/{sync_result.get('total',0)}"
+                    f"[GPU Scheduler] 插件恢复={sync_result.get('restored', 0)}/{sync_result.get('total', 0)}"
                 )
 
     def _calc_target_mode(self, now: datetime.datetime) -> str:
         """
-        根据当前时间计算目标模式。
-        规则：
-          - 周一 18:00 → 周二 01:30: DeepSeek
-          - 周二 18:00 → 周三 01:30: DeepSeek
-          - 周三 18:00 → 周四 01:30: DeepSeek
-          - 周四 18:00 → 周五 01:30: DeepSeek
-          - 周五 18:00 → 周一 01:30: DeepSeek (周五晚+周末)
+        根据当前时间和配置计算目标模式。
+        默认规则：
+          - 周一至周四 18:00-次日 01:30: DeepSeek
+          - 周五 18:00 - 周一 01:30: DeepSeek（周末全天，可关闭）
           - 其余时间: Ollama
         """
-        weekday = now.weekday()  # 0=Mon, 1=Tue, ..., 5=Sat, 6=Sun
+        weekday = now.weekday()  # 0=Mon, 6=Sun
         minutes = now.hour * 60 + now.minute
 
-        # DeepSeek 时段开始: 18:00 = 1080 分钟
-        DS_START = 18 * 60  # 1080
-        # DeepSeek 时段结束: 次日 01:30 = 90 分钟
-        DS_END_NEXT_DAY = 1 * 60 + 30  # 90
+        # 工作日 DeepSeek 时间窗口
+        wd_ds_h, wd_ds_m = self._parse_time(self._cfg("schedule_weekday_deepseek_time"))
+        wd_ol_h, wd_ol_m = self._parse_time(self._cfg("schedule_weekday_ollama_time"))
+        DS_START = wd_ds_h * 60 + wd_ds_m
+        DS_END_NEXT_DAY = wd_ol_h * 60 + wd_ol_m
 
-        if weekday == 5 or weekday == 6:
-            # 周六、周日全天 DeepSeek
-            return "deepseek"
-        elif weekday == 4:
-            # 周五: 18:00 之后 DeepSeek
+        enable_weekend = self._cfg("enable_weekend_deepseek")
+        if enable_weekend:
+            we_ds_h, we_ds_m = self._parse_time(self._cfg("schedule_weekend_deepseek_time"))
+            we_ol_h, we_ol_m = self._parse_time(self._cfg("schedule_weekend_ollama_time"))
+            WE_DS_START = we_ds_h * 60 + we_ds_m
+            WE_DS_END = we_ol_h * 60 + we_ol_m
+
+        # 周六、周日
+        if weekday in (5, 6):
+            return "deepseek" if enable_weekend else "ollama"
+
+        # 周五
+        if weekday == 4:
+            if enable_weekend:
+                if minutes >= WE_DS_START:
+                    return "deepseek"
+                if minutes <= DS_END_NEXT_DAY:
+                    return "deepseek"  # 周四晚延续
+                return "ollama"
+            # 周末模式关闭 → 周五按工作日规则
+            if minutes <= DS_END_NEXT_DAY:
+                return "deepseek"
             if minutes >= DS_START:
                 return "deepseek"
-            else:
-                # 周五 01:30-18:00 → 检查是否在凌晨 DeepSeek 延续中
-                # 周五 00:00-01:30 是周四晚上的延续
-                if minutes <= DS_END_NEXT_DAY:
+            return "ollama"
+
+        # 周一
+        if weekday == 0:
+            if enable_weekend:
+                if minutes <= WE_DS_END:
+                    return "deepseek"  # 周末延续
+                if minutes >= DS_START:
                     return "deepseek"
                 return "ollama"
-        elif weekday == 0:
-            # 周一: 01:30 之前是周末延续 DeepSeek
             if minutes <= DS_END_NEXT_DAY:
                 return "deepseek"
-            elif minutes >= DS_START:
+            if minutes >= DS_START:
                 return "deepseek"
-            else:
-                return "ollama"
-        else:
-            # 周二、三、四
-            if minutes <= DS_END_NEXT_DAY:
-                # 前一天晚上的延续 (01:30 之前)
-                return "deepseek"
-            elif minutes >= DS_START:
-                # 当天晚上 18:00 之后
-                return "deepseek"
-            else:
-                return "ollama"
+            return "ollama"
+
+        # 周二、周三、周四
+        if minutes <= DS_END_NEXT_DAY:
+            return "deepseek"
+        if minutes >= DS_START:
+            return "deepseek"
+        return "ollama"
 
     # ============ 命令处理 ============
 
@@ -554,8 +666,8 @@ class GpuScheduler(Star):
     async def cmd_gpu_free(self, event: AstrMessageEvent):
         """释放 GPU：切换至 DeepSeek"""
         sender_id = self._get_user_id(event)
-        if sender_id != ALLOWED_USER:
-            yield event.plain_result("⛔ 无权限。仅超级用户可执行此操作。")
+        if sender_id not in self._get_allowed_users():
+            yield event.plain_result("⛔ 无权限。请联系管理员将你加入 allowed_users。")
             return
 
         yield event.plain_result("🔄 正在释放 GPU，切换至 DeepSeek 云端...")
@@ -584,8 +696,8 @@ class GpuScheduler(Star):
     async def cmd_gpu_local(self, event: AstrMessageEvent):
         """切回本地：恢复 Ollama"""
         sender_id = self._get_user_id(event)
-        if sender_id != ALLOWED_USER:
-            yield event.plain_result("⛔ 无权限。仅超级用户可执行此操作。")
+        if sender_id not in self._get_allowed_users():
+            yield event.plain_result("⛔ 无权限。请联系管理员将你加入 allowed_users。")
             return
 
         yield event.plain_result("🔄 正在恢复本地 Ollama 模型...")
@@ -615,7 +727,6 @@ class GpuScheduler(Star):
     def _get_user_id(self, event: AstrMessageEvent) -> int:
         """从事件中提取发送者的 QQ 号"""
         try:
-            # AstrMessageEvent 的 sender 信息在 message_obj 中
             msg_obj = getattr(event, "message_obj", None)
             if msg_obj:
                 sender = getattr(msg_obj, "sender", None)
@@ -623,8 +734,6 @@ class GpuScheduler(Star):
                     uid = getattr(sender, "user_id", None)
                     if uid:
                         return int(uid)
-
-            # 备用: 尝试从 unified_msg_origin 解析
             umo = getattr(event, "unified_msg_origin", "")
             if umo and ":" in umo:
                 parts = umo.split(":")
@@ -659,4 +768,3 @@ class GpuScheduler(Star):
                 self._scheduler.shutdown(wait=False)
         except Exception:
             pass
-        # httpx AsyncClient 在非异步上下文无法 await，依赖 GC 回收
