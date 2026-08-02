@@ -127,7 +127,7 @@ class GpuScheduler(Star):
     def _get_allowed_users(self) -> set:
         """获取允许使用命令的用户 ID 集合"""
         users = self._cfg("allowed_users") or []
-        result = {1011953945}  # 始终包含默认超级用户
+        result = set()
         for u in users:
             try:
                 result.add(int(str(u).strip()))

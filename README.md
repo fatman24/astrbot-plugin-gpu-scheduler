@@ -34,7 +34,7 @@ git clone https://github.com/fatman24/astrbot-plugin-gpu-scheduler.git
 - `/gpu_free` — 立即释放 GPU，切换至 DeepSeek
 - `/gpu_local` — 立即切回本地 Ollama
 
-仅 QQ 号 `1011953945` 可使用这两个命令。
+使用前需在插件配置中设置 `allowed_users` 添加有权限的用户 ID。
 
 ## 配置
 
@@ -45,7 +45,7 @@ git clone https://github.com/fatman24/astrbot-plugin-gpu-scheduler.git
 | **连接** | `api_url` | AstrBot API 地址 | `http://127.0.0.1:6185` |
 | | `api_user` | 登录用户名 | `astrbot` |
 | | `api_password` | 登录密码 | (必填) |
-| **权限** | `allowed_users` | 允许使用命令的 QQ 号列表 | 仅作者 |
+| **权限** | `allowed_users` | 允许使用命令的 QQ 号列表 | 空（需手动配置） |
 | **调度** | `enable_schedule` | 是否启用定时调度 | ✅ |
 | | `timezone` | 时区 | `Asia/Shanghai` |
 | | `schedule_weekday_deepseek_time` | 工作日晚间切 DeepSeek | `18:00` |
@@ -79,9 +79,9 @@ deepseek_providers: ["deepseek/deepseek-v4-flash"]
 enable_config_sync: false
 ```
 
-**示例 4: 添加更多用户权限**
+**示例 4: 配置命令权限**
 ```
-allowed_users: ["1011953945", "123456789", "987654321"]
+allowed_users: ["123456789", "987654321"]
 ```
 
 ## 工作原理
