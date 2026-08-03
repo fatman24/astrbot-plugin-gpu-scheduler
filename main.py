@@ -73,6 +73,12 @@ class GpuScheduler(Star):
         self._mode: str = "unknown"
         self._scheduler: AsyncIOScheduler | None = None
 
+        # 配置文件路径（用于启动时序问题的回退读取）
+        self._config_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "..", "config", "astrbot_plugin_gpu_scheduler_config.json"
+        )
+
         # 初始化调度器
         self._setup_schedule()
 
@@ -87,10 +93,20 @@ class GpuScheduler(Star):
 
     def _cfg(self, key):
         """读取插件配置，自动回退到 _conf_schema.json 默认值"""
+        val = None
+        # 优先从 AstrBot 的 self.config 读取
         try:
             val = self.config.get(key) if hasattr(self, "config") and self.config else None
         except Exception:
             val = None
+        # 回退：直接从配置文件读取（解决启动时序问题）
+        if (val is None or val == "" or val == []) and hasattr(self, "_config_file"):
+            try:
+                with open(self._config_file, "r", encoding="utf-8-sig") as f:
+                    file_config = json.load(f)
+                val = file_config.get(key)
+            except Exception:
+                pass
         if val is not None and val != "" and val != []:
             return val
         return _CONFIG_DEFAULTS.get(key)
