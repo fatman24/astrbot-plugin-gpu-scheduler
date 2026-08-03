@@ -259,13 +259,14 @@ class GpuScheduler(Star):
     async def switch_to_ollama(self) -> dict:
         """
         切换到 Ollama 模式：
+        - 禁用所有 DeepSeek chat providers（释放 API 配额）
         - 启用所有 Ollama chat providers
-        - DeepSeek providers 不动（保持可用作为备选）
         """
         logger.info("[GPU Scheduler] 开始切换至 Ollama 模式...")
         results = {"success": [], "failed": [], "skipped": []}
 
         ollama_list = self._get_ollama_providers()
+        deepseek_list = self._get_deepseek_providers()
 
         providers = await self._get_providers()
         if not providers:
@@ -280,7 +281,13 @@ class GpuScheduler(Star):
                 continue
 
             try:
-                if pid in ollama_list:
+                if pid in deepseek_list:
+                    if p.get("enable", True):
+                        await self._patch_provider_enabled(pid, False)
+                        results["success"].append(f"{pid} → disabled")
+                    else:
+                        results["skipped"].append(f"{pid} (already off)")
+                elif pid in ollama_list:
                     if not p.get("enable", False):
                         await self._patch_provider_enabled(pid, True)
                         results["success"].append(f"{pid} → enabled")
